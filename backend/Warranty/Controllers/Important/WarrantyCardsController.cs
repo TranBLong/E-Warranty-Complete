@@ -1,0 +1,256 @@
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+using Warranty.Constants;
+using Warranty.Data;
+using Warranty.Dtos;
+using Warranty.Enums;
+using Warranty.Models;
+using Warranty.Services;
+
+namespace Warranty.Controllers;
+
+[ApiController]
+[Authorize]
+[Route("api/warranty-cards")]
+public sealed class WarrantyCardsController(AppDbContext dbContext) : ControllerBase
+{
+    [HttpGet]
+    public async Task<ActionResult<IReadOnlyList<WarrantyCardResponse>>> GetAll(
+        [FromQuery] string? search,
+        [FromQuery] string? sortBy,
+        [FromQuery] string? sortDir,
+        [FromQuery] string? status,
+        CancellationToken cancellationToken)
+    {
+        var cards = dbContext.WarrantyCards.AsNoTracking()
+            .Include(card => card.Product)
+            .Include(card => card.Customer)
+            .AsQueryable();
+
+        if (User.IsInRole(nameof(UserRole.Customer)))
+        {
+            if (!User.TryGetUserId(out var customerId)) return Unauthorized();
+            cards = cards.Where(card => card.CustomerId == customerId);
+        }
+        else if (!User.IsInAnyRole(
+                     nameof(UserRole.Admin),
+                     nameof(UserRole.Manager),
+                     nameof(UserRole.Receptionist),
+                     nameof(UserRole.Technician)))
+        {
+            return Forbid();
+        }
+
+        if (!string.IsNullOrWhiteSpace(status) &&
+            Enum.TryParse<WarrantyStatus>(status, true, out var statusFilter))
+        {
+            cards = cards.Where(c => c.Status == statusFilter);
+        }
+
+        if (!string.IsNullOrWhiteSpace(search))
+        {
+            var term = search.Trim().ToLower();
+            cards = cards.Where(c =>
+                c.Product.Name.ToLower().Contains(term) ||
+                c.Product.SerialNumber.ToLower().Contains(term) ||
+                c.Customer.FullName.ToLower().Contains(term));
+        }
+
+        var desc = string.Equals(sortDir, "desc", StringComparison.OrdinalIgnoreCase);
+        cards = (sortBy?.ToLowerInvariant()) switch
+        {
+            "product" or "productname" => desc ? cards.OrderByDescending(c => c.Product.Name) : cards.OrderBy(c => c.Product.Name),
+            "customer" or "customername" => desc ? cards.OrderByDescending(c => c.Customer.FullName) : cards.OrderBy(c => c.Customer.FullName),
+            "enddate" => desc ? cards.OrderByDescending(c => c.EndDate) : cards.OrderBy(c => c.EndDate),
+            "status" => desc ? cards.OrderByDescending(c => c.Status) : cards.OrderBy(c => c.Status),
+            "id" => desc ? cards.OrderByDescending(c => c.Id) : cards.OrderBy(c => c.Id),
+            _ => desc ? cards.OrderByDescending(c => c.StartDate) : cards.OrderBy(c => c.StartDate)
+        };
+
+        return Ok(await cards.Select(card => ToResponse(card)).ToListAsync(cancellationToken));
+    }
+
+    [HttpGet("{id:int}")]
+    public async Task<ActionResult<WarrantyCardResponse>> GetById(int id, CancellationToken cancellationToken)
+    {
+        var card = await dbContext.WarrantyCards.AsNoTracking()
+            .Include(candidate => candidate.Product)
+            .Include(candidate => candidate.Customer)
+            .SingleOrDefaultAsync(candidate => candidate.Id == id, cancellationToken);
+        if (card is null) return NotFound();
+
+        if (User.IsInRole(nameof(UserRole.Customer)))
+        {
+            if (!User.TryGetUserId(out var customerId)) return Unauthorized();
+            if (card.CustomerId != customerId) return Forbid();
+        }
+        else if (!User.IsInAnyRole(
+                     nameof(UserRole.Admin),
+                     nameof(UserRole.Manager),
+                     nameof(UserRole.Receptionist),
+                     nameof(UserRole.Technician)))
+        {
+            return Forbid();
+        }
+
+        return Ok(ToResponse(card));
+    }
+
+    /// <summary>Tra cứu bảo hành theo serial number sản phẩm.</summary>
+    [HttpGet("by-serial/{serial}")]
+    [AllowAnonymous]
+    public async Task<ActionResult<object>> LookupBySerial(string serial, CancellationToken cancellationToken)
+    {
+        var normalized = serial.Trim().ToUpperInvariant();
+        var card = await dbContext.WarrantyCards.AsNoTracking()
+            .Include(c => c.Product)
+            .Include(c => c.Customer)
+            .Where(c => c.Product.SerialNumber == normalized)
+            .OrderByDescending(c => c.StartDate)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (card is null)
+            return NotFound(new ProblemDetails { Title = "No warranty card found for this serial number." });
+
+        return Ok(new
+        {
+            card.Id,
+            ProductName = card.Product.Name,
+            card.Product.Brand,
+            card.Product.Model,
+            SerialNumber = card.Product.SerialNumber,
+            CustomerName = card.Customer.FullName,
+            card.StartDate,
+            card.EndDate,
+            Status = card.Status.ToString(),
+            IsValid = card.Status == WarrantyStatus.Active && card.EndDate >= DateTime.UtcNow.Date
+        });
+    }
+
+
+    [Authorize(Policy = Policies.Staff)]
+    [HttpPost]
+    public async Task<ActionResult<WarrantyCardResponse>> Create(
+        CreateWarrantyCardRequest request,
+        CancellationToken cancellationToken)
+    {
+        if (request.StartDate == default)
+        {
+            return BadRequest(new ProblemDetails { Title = "Start date is required." });
+        }
+
+        var product = await dbContext.Products.SingleOrDefaultAsync(
+            candidate => candidate.Id == request.ProductId, cancellationToken);
+        if (product is null)
+        {
+            return BadRequest(new ProblemDetails { Title = "Product was not found." });
+        }
+
+        var customer = await dbContext.Users.SingleOrDefaultAsync(
+            candidate => candidate.Id == request.CustomerId && candidate.Role == UserRole.Customer && candidate.IsActive,
+            cancellationToken);
+        if (customer is null)
+        {
+            return BadRequest(new ProblemDetails { Title = "An active Customer account is required." });
+        }
+
+        var startDate = DateTime.SpecifyKind(request.StartDate.Date, DateTimeKind.Utc);
+        var card = new WarrantyCard
+        {
+            ProductId = product.Id,
+            CustomerId = customer.Id,
+            StartDate = startDate,
+            EndDate = startDate.AddMonths(product.WarrantyMonths),
+            Status = WarrantyStatus.Active
+        };
+        dbContext.WarrantyCards.Add(card);
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        card.Product = product;
+        card.Customer = customer;
+        return CreatedAtAction(nameof(GetById), new { id = card.Id }, ToResponse(card));
+    }
+
+    [Authorize(Policy = Policies.Staff)]
+    [HttpPut("{id:int}")]
+    public async Task<ActionResult<WarrantyCardResponse>> Update(
+        int id,
+        UpdateWarrantyCardRequest request,
+        CancellationToken cancellationToken)
+    {
+        var card = await dbContext.WarrantyCards
+            .Include(c => c.Product)
+            .Include(c => c.Customer)
+            .SingleOrDefaultAsync(c => c.Id == id, cancellationToken);
+        if (card is null) return NotFound();
+
+        if (request.Status is not null)
+        {
+            if (!Enum.IsDefined(request.Status.Value))
+            {
+                return BadRequest(new ProblemDetails { Title = "Invalid warranty status." });
+            }
+            card.Status = request.Status.Value;
+        }
+
+        if (request.StartDate is not null)
+        {
+            card.StartDate = DateTime.SpecifyKind(request.StartDate.Value.Date, DateTimeKind.Utc);
+            card.EndDate = card.StartDate.AddMonths(card.Product.WarrantyMonths);
+        }
+
+        if (request.EndDate is not null)
+        {
+            var end = DateTime.SpecifyKind(request.EndDate.Value.Date, DateTimeKind.Utc);
+            if (end < card.StartDate)
+            {
+                return BadRequest(new ProblemDetails { Title = "End date must be on or after start date." });
+            }
+            card.EndDate = end;
+        }
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+        return Ok(ToResponse(card));
+    }
+
+    [Authorize(Policy = Policies.Staff)]
+    [HttpDelete("{id:int}")]
+    public async Task<IActionResult> VoidOrDelete(int id, CancellationToken cancellationToken)
+    {
+        var card = await dbContext.WarrantyCards.SingleOrDefaultAsync(c => c.Id == id, cancellationToken);
+        if (card is null) return NotFound();
+
+        if (await dbContext.RepairRequests.AnyAsync(r => r.WarrantyCardId == id, cancellationToken))
+        {
+            // Soft: void instead of hard delete when referenced
+            card.Status = WarrantyStatus.Voided;
+            await dbContext.SaveChangesAsync(cancellationToken);
+            return Ok(new { message = "Card voided because it has repair requests." });
+        }
+
+        dbContext.WarrantyCards.Remove(card);
+        await dbContext.SaveChangesAsync(cancellationToken);
+        return NoContent();
+    }
+
+    private static WarrantyCardResponse ToResponse(WarrantyCard card) => new(
+        card.Id,
+        card.ProductId,
+        card.Product.Name,
+        card.Product.SerialNumber,
+        card.CustomerId,
+        card.Customer.FullName,
+        card.StartDate,
+        card.EndDate,
+        card.Status == WarrantyStatus.Active && card.EndDate.Date < DateTime.UtcNow.Date
+            ? WarrantyStatus.Expired
+            : card.Status);
+}
+
+public sealed class UpdateWarrantyCardRequest
+{
+    public DateTime? StartDate { get; init; }
+    public DateTime? EndDate { get; init; }
+    public WarrantyStatus? Status { get; init; }
+}

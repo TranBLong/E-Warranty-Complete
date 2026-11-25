@@ -1,0 +1,14 @@
+**/.git
+**/.vs
+**/bin
+**/obj
+**/node_modules
+**/*.user
+**/*.suo
+**/App_Data
+**/logs
+**/TestResults
+**/Warranty.Tests
+**/.env
+**/*.md
+!README.md
